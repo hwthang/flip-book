@@ -1,0 +1,11 @@
+@import "@angular/cdk/overlay-prebuilt.css";
+@import "tailwindcss";
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  @apply bg-stone-50 text-stone-900 antialiased;
+}
