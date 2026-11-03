@@ -33,7 +33,7 @@ const FALLBACK_RATIO = 3 / 4;
       ✕
     </button>
     <div #stage class="flex min-h-0 flex-1 items-center justify-center overflow-hidden p-4">
-      <div #book></div>
+      <div #frame><div #book></div></div>
     </div>
     <div class="shrink-0 pb-4">
       <app-presentation-toolbar
@@ -52,6 +52,7 @@ export class FlipbookViewer implements OnDestroy {
   private readonly host = inject<ElementRef<HTMLElement>>(ElementRef);
   private readonly stage = viewChild.required<ElementRef<HTMLElement>>('stage');
   private readonly bookHost = viewChild.required<ElementRef<HTMLElement>>('book');
+  private readonly frame = viewChild.required<ElementRef<HTMLElement>>('frame');
 
   private flip: PageFlip | null = null;
   private buildToken = 0;
@@ -119,8 +120,11 @@ export class FlipbookViewer implements OnDestroy {
     // Always show a single page so an odd page count never leaves a gap.
     const pageW = Math.floor(Math.min(availW, availH * ratio));
     const pageH = Math.floor(pageW / ratio);
-    container.style.width = `${pageW}px`;
-    container.style.height = `${pageH}px`;
+    // The lib forces its own container to width:100%, so size the frame around it;
+    // a block narrower than two pages makes it pick portrait (single page) mode.
+    const frame = this.frame().nativeElement;
+    frame.style.width = `${pageW}px`;
+    frame.style.height = `${pageH}px`;
 
     const flip = new PageFlip(container, {
       width: pageW,
