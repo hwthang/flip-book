@@ -20,6 +20,7 @@ declare module 'page-flip' {
     flipPrev(corner?: 'top' | 'bottom'): void;
     getPageCount(): number;
     getCurrentPageIndex(): number;
+    getFlipController(): object;
     destroy(): void;
   }
 }

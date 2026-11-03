@@ -18,6 +18,20 @@ import { PresentationToolbar } from '../presentation-toolbar/presentation-toolba
 
 const FALLBACK_RATIO = 3 / 4;
 
+type Point = { x: number; y: number };
+
+/** Parts of StPageFlip's FlipController that the typings don't expose. */
+interface FlipControllerInternals {
+  calc: { getDirection(): number; getCorner(): string; getPosition(): Point } | null;
+  render: { finishAnimation(): void; convertToPage(pos: Point): Point };
+  showCorner(pos: Point): void;
+  checkState(...states: string[]): boolean;
+  setState(state: string): void;
+  start(pos: Point): boolean;
+  do(pos: Point): void;
+  animateFlippingTo(from: Point, to: Point, turn: boolean): void;
+}
+
 @Component({
   selector: 'app-flipbook-viewer',
   imports: [PresentationToolbar],
@@ -137,10 +151,48 @@ export class FlipbookViewer implements OnDestroy {
       flippingTime: 700,
     });
     flip.loadFromHTML(images.map((img) => this.createPage(img)));
-    flip.on('flip', (e) => this.pageIndex.set(e.data as number));
+    this.enableBackCornerPeel(flip, pageW, pageH);
+    flip.on('flip',(e) => this.pageIndex.set(e.data as number));
     this.flip = flip;
     this.pageIndex.set(0);
     this.pageCount.set(flip.getPageCount());
+  }
+
+  /**
+   * In portrait mode the lib's own hover fold for "previous" sits one page-width left of
+   * the canvas, so the left corners never peel. Drive the same controller ourselves:
+   * hovering a left corner pulls the previous page's corner in over the current page,
+   * and leaving eases it back without turning the page.
+   */
+  private enableBackCornerPeel(flip: PageFlip, pageW: number, pageH: number): void {
+    const ctl = flip.getFlipController() as unknown as FlipControllerInternals;
+    const libShowCorner = ctl.showCorner.bind(ctl);
+    const zone = Math.hypot(pageW, pageH) / 5;
+
+    const releaseBackFold = () => {
+      const calc = ctl.calc;
+      if (!calc || calc.getDirection() !== 1) return;
+      const corner = calc.getCorner();
+      ctl.setState('read');
+      ctl.render.finishAnimation();
+      ctl.animateFlippingTo(calc.getPosition(), { x: pageW, y: corner === 'bottom' ? pageH : 0 }, false);
+    };
+
+    ctl.showCorner = (pos) => {
+      if (!ctl.checkState('read', 'fold_corner')) return;
+      const inLeftCorner =
+        pos.x >= 0 && pos.x < zone && pos.y >= 0 && pos.y < pageH && (pos.y < zone || pos.y > pageH - zone);
+
+      if (inLeftCorner) {
+        if (!ctl.calc && !ctl.start(pos)) return;
+        if (ctl.calc?.getDirection() !== 1) return;
+        ctl.setState('fold_corner');
+        ctl.do(ctl.render.convertToPage(pos));
+      } else {
+        releaseBackFold();
+        libShowCorner(pos);
+      }
+    };
   }
 
   private createPage(image: ImageItem): HTMLElement {
