@@ -116,17 +116,18 @@ export class FlipbookViewer implements OnDestroy {
     const { clientWidth, clientHeight } = this.stage().nativeElement;
     const availW = Math.max(clientWidth - 32, 200);
     const availH = Math.max(clientHeight - 32, 200);
-    const spread = availW >= 700 && images.length > 1;
-    // A spread shows two pages side by side; a single page fills the stage alone.
-    const pageW = Math.floor(Math.min(spread ? availW / 2 : availW, availH * ratio));
+    // Always show a single page so an odd page count never leaves a gap.
+    const pageW = Math.floor(Math.min(availW, availH * ratio));
     const pageH = Math.floor(pageW / ratio);
+    container.style.width = `${pageW}px`;
+    container.style.height = `${pageH}px`;
 
     const flip = new PageFlip(container, {
       width: pageW,
       height: pageH,
       size: 'fixed',
-      showCover: true,
-      usePortrait: !spread,
+      showCover: false,
+      usePortrait: true,
       mobileScrollSupport: false,
       maxShadowOpacity: 0.5,
       flippingTime: 700,
