@@ -4,19 +4,26 @@ import {
   ElementRef,
   HostListener,
   OnDestroy,
+  afterNextRender,
   computed,
   effect,
   inject,
   output,
   signal,
+  untracked,
   viewChild,
 } from '@angular/core';
 import { PageFlip } from 'page-flip';
 import { ImageItem } from '../../../../core/models/image-item.model';
 import { ImageSessionService } from '../../../../core/services/image-session.service';
-import { PresentationToolbar } from '../presentation-toolbar/presentation-toolbar';
+import { DisplayMode, PresentationToolbar } from '../presentation-toolbar/presentation-toolbar';
 
 const FALLBACK_RATIO = 3 / 4;
+const MIN_SPREAD_WIDTH = 600;
+const ZOOM_MIN = 0.5;
+const ZOOM_MAX = 3;
+const ZOOM_STEP = 0.25;
+const FLIP_DURATION_MS = 300;
 
 type Point = { x: number; y: number };
 
@@ -36,26 +43,27 @@ interface FlipControllerInternals {
   selector: 'app-flipbook-viewer',
   imports: [PresentationToolbar],
   changeDetection: ChangeDetectionStrategy.OnPush,
-  host: { class: 'relative flex h-full w-full flex-col bg-neutral-900' },
+  host: { class: 'flex h-full w-full flex-col bg-slate-100' },
   template: `
-    <button
-      type="button"
-      class="absolute right-4 top-4 z-10 h-10 w-10 rounded-full bg-white/15 text-xl text-white hover:bg-white/30"
-      aria-label="Đóng"
-      (click)="closed.emit()"
-    >
-      ✕
-    </button>
-    <div #stage class="flex min-h-0 flex-1 items-center justify-center overflow-hidden p-4">
-      <div #frame><div #book></div></div>
-    </div>
-    <div class="shrink-0 pb-4">
-      <app-presentation-toolbar
-        [label]="label()"
-        (prev)="prev()"
-        (next)="next()"
-        (fullscreen)="toggleFullscreen()"
-      />
+    <app-presentation-toolbar
+      [page]="pageIndex() + 1"
+      [total]="pageCount()"
+      [zoomPercent]="zoomPercent()"
+      [mode]="activeMode()"
+      [canDouble]="canDouble()"
+      (close)="closed.emit()"
+      (first)="goTo(1)"
+      (prev)="prev()"
+      (next)="next()"
+      (last)="goTo(pageCount())"
+      (goto)="goTo($event)"
+      (zoomIn)="changeZoom(1)"
+      (zoomOut)="changeZoom(-1)"
+      (modeChange)="mode.set($event)"
+      (fullscreen)="toggleFullscreen()"
+    />
+    <div #stage class="flex min-h-0 flex-1 overflow-auto p-4">
+      <div #frame class="m-auto shrink-0"></div>
     </div>
   `,
 })
@@ -65,27 +73,50 @@ export class FlipbookViewer implements OnDestroy {
   private readonly session = inject(ImageSessionService);
   private readonly host = inject<ElementRef<HTMLElement>>(ElementRef);
   private readonly stage = viewChild.required<ElementRef<HTMLElement>>('stage');
-  private readonly bookHost = viewChild.required<ElementRef<HTMLElement>>('book');
   private readonly frame = viewChild.required<ElementRef<HTMLElement>>('frame');
 
   private flip: PageFlip | null = null;
   private buildToken = 0;
+  private resizeObserver: ResizeObserver | null = null;
+  private resizeTimer: ReturnType<typeof setTimeout> | undefined;
 
-  private readonly pageIndex = signal(0);
-  private readonly pageCount = signal(0);
-  protected readonly label = computed(() =>
-    this.pageCount() ? `${this.pageIndex() + 1} / ${this.pageCount()}` : '',
-  );
+  protected readonly pageIndex = signal(0);
+  protected readonly pageCount = signal(0);
+  protected readonly mode = signal<DisplayMode>('single');
+  /** Mode actually in use: a spread needs a wide stage and more than one image. */
+  protected readonly activeMode = signal<DisplayMode>('single');
+  protected readonly canDouble = signal(true);
+  private readonly zoom = signal(1);
+  protected readonly zoomPercent = computed(() => Math.round(this.zoom() * 100));
+  private readonly layoutTick = signal(0);
 
   constructor() {
     effect(() => {
       const images = this.session.images();
-      void this.build(images);
+      const mode = this.mode();
+      const zoom = this.zoom();
+      this.layoutTick();
+      untracked(() => void this.build(images, mode, zoom));
+    });
+
+    afterNextRender(() => {
+      const stage = this.stage().nativeElement;
+      let lastW = stage.clientWidth;
+      let lastH = stage.clientHeight;
+      this.resizeObserver = new ResizeObserver(() => {
+        if (stage.clientWidth === lastW && stage.clientHeight === lastH) return;
+        lastW = stage.clientWidth;
+        lastH = stage.clientHeight;
+        clearTimeout(this.resizeTimer);
+        this.resizeTimer = setTimeout(() => this.layoutTick.update((n) => n + 1), 150);
+      });
+      this.resizeObserver.observe(stage);
     });
   }
 
   @HostListener('document:keydown', ['$event'])
   protected onKey(event: KeyboardEvent): void {
+    if (event.target instanceof HTMLInputElement) return;
     if (event.key === 'ArrowRight') this.next();
     else if (event.key === 'ArrowLeft') this.prev();
   }
@@ -98,6 +129,17 @@ export class FlipbookViewer implements OnDestroy {
     this.flip?.flipPrev();
   }
 
+  /** @param page 1-based page number */
+  protected goTo(page: number): void {
+    const count = this.pageCount();
+    if (!this.flip || !count) return;
+    this.flip.flip(Math.min(Math.max(Math.round(page), 1), count) - 1);
+  }
+
+  protected changeZoom(direction: 1 | -1): void {
+    this.zoom.update((z) => Math.min(Math.max(z + direction * ZOOM_STEP, ZOOM_MIN), ZOOM_MAX));
+  }
+
   protected toggleFullscreen(): void {
     if (document.fullscreenElement) void document.exitFullscreen();
     else void this.host.nativeElement.requestFullscreen?.();
@@ -105,6 +147,8 @@ export class FlipbookViewer implements OnDestroy {
 
   ngOnDestroy(): void {
     this.buildToken++;
+    clearTimeout(this.resizeTimer);
+    this.resizeObserver?.disconnect();
     this.destroyFlip();
     if (document.fullscreenElement) void document.exitFullscreen();
   }
@@ -114,11 +158,13 @@ export class FlipbookViewer implements OnDestroy {
     this.flip = null;
   }
 
-  private async build(images: ImageItem[]): Promise<void> {
+  private async build(images: ImageItem[], mode: DisplayMode, zoom: number): Promise<void> {
     const token = ++this.buildToken;
+    const startPage = Math.min(this.pageIndex(), Math.max(images.length - 1, 0));
     this.destroyFlip();
-    const container = this.bookHost().nativeElement;
-    container.replaceChildren();
+    // The lib removes its container on destroy(), so every build gets a fresh one.
+    const container = document.createElement('div');
+    this.frame().nativeElement.replaceChildren(container);
     if (!images.length) {
       this.pageCount.set(0);
       this.closed.emit();
@@ -131,30 +177,41 @@ export class FlipbookViewer implements OnDestroy {
     const { clientWidth, clientHeight } = this.stage().nativeElement;
     const availW = Math.max(clientWidth - 32, 200);
     const availH = Math.max(clientHeight - 32, 200);
-    // Always show a single page so an odd page count never leaves a gap.
-    const pageW = Math.floor(Math.min(availW, availH * ratio));
+    const canDouble = availW >= MIN_SPREAD_WIDTH && images.length > 1;
+    const double = mode === 'double' && canDouble;
+    this.canDouble.set(canDouble);
+    this.activeMode.set(double ? 'double' : 'single');
+
+    const fitW = double ? availW / 2 : availW;
+    const pageW = Math.floor(Math.min(fitW, availH * ratio) * zoom);
     const pageH = Math.floor(pageW / ratio);
-    // The lib forces its own container to width:100%, so size the frame around it;
-    // a block narrower than two pages makes it pick portrait (single page) mode.
+    // The lib forces its own container to width:100%, so size the frame around it:
+    // a block narrower than two pages makes it pick portrait (single page) mode, and
+    // exactly two pages wide gives the spread.
     const frame = this.frame().nativeElement;
-    frame.style.width = `${pageW}px`;
+    frame.style.width = `${double ? pageW * 2 : pageW}px`;
     frame.style.height = `${pageH}px`;
 
     const flip = new PageFlip(container, {
       width: pageW,
       height: pageH,
       size: 'fixed',
-      showCover: false,
-      usePortrait: true,
+      startPage,
+      showCover: double,
+      usePortrait: !double,
       mobileScrollSupport: false,
       maxShadowOpacity: 0.5,
-      flippingTime: 700,
+      flippingTime: FLIP_DURATION_MS,
     });
     flip.loadFromHTML(images.map((img) => this.createPage(img)));
-    this.enableBackCornerPeel(flip, pageW, pageH);
-    flip.on('flip',(e) => this.pageIndex.set(e.data as number));
+    if (!double) this.enableBackCornerPeel(flip, pageW, pageH);
+    flip.on('flip', (e) => this.pageIndex.set(e.data as number));
     this.flip = flip;
-    this.pageIndex.set(0);
+    // When zoomed past the stage, start from the middle of the overflow.
+    const stage = this.stage().nativeElement;
+    stage.scrollLeft = (stage.scrollWidth - stage.clientWidth) / 2;
+    stage.scrollTop = (stage.scrollHeight - stage.clientHeight) / 2;
+    this.pageIndex.set(startPage);
     this.pageCount.set(flip.getPageCount());
   }
 
@@ -197,7 +254,7 @@ export class FlipbookViewer implements OnDestroy {
 
   private createPage(image: ImageItem): HTMLElement {
     const page = document.createElement('div');
-    page.style.background = '#fff';
+    page.style.background = '#f8f9fa';
     const img = document.createElement('img');
     img.src = image.previewUrl;
     img.alt = image.name;
